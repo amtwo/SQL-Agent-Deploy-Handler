@@ -39,13 +39,14 @@ runs inside a transaction and rolls back if any step fails.
 ## Repo layout
 
 ```
-Invoke-AgentHandler.ps1      The generator. This is the whole tool.
-job-source/                 Your hand-authored job definitions (one folder per job).
-  scratch-db-purge/         Example job — copy this as a starting point.
-    job.json                Job metadata + schedule(s).
-    01_Purge scratchdb.sql  A job step.
-job-tsql/                   Generated output. Committed, but never edited by hand.
-brainstorm.md               Original design notes (historical).
+Invoke-AgentHandler.ps1                The generator. This is the whole tool.
+job-source/                            Your hand-authored job definitions (one folder per job).
+  example-1/                           Example job — copy this as a starting point.
+    job.json                           Job metadata + schedule(s).
+    01_Purge scratchdb.sql             A T-SQL job step.
+    02_Cleanup temporary temp files.ps1  A PowerShell job step.
+job-tsql/                              Generated output. Committed, but never edited by hand.
+brainstorm.md                          Original design notes (historical).
 ```
 
 The `Agent_Upsert_*` helper procedures the generated scripts depend on are **not** part
