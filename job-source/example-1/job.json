@@ -1,0 +1,15 @@
+{
+    "name": "DBA - scratchdb purge old objects",
+    "category": "DBA Maintenance",
+    "description": "This job runs weekly to purge expired temp objects from scratchdb",
+    "enabled": true,
+    "owner": "sa",
+    "schedules": [
+        {
+            "name": "Weekly Sunday 4am",
+            "frequency": "weekly",
+            "daysOfWeek": [ "sunday" ],
+            "time": "04:00"
+        }
+    ]
+}
