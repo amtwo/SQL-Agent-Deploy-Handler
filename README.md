@@ -24,11 +24,12 @@ job-source/<your job>/   ──►   Invoke-AgentHandler.ps1   ──►   job-t
 4. Your deploy pipeline runs the generated `.sql` against the target instance.
 
 The generated script is **idempotent**: it calls a set of `Agent_Upsert_*` helper
-procedures (installed once per instance — see [Helper procedures](#helper-procedures))
-that create each object if it's missing and update it in place otherwise. Re-running a
-generated script reconciles the live job back to its source files, so it's safe to run
-on every deploy. The whole batch runs inside a transaction and rolls back if any step
-fails.
+procedures that create each object if it's missing and update it in place otherwise.
+These procedures ship with the [dba-database](https://github.com/amtwo/dba-database)
+project and must be installed on the target instance once — see
+[Helper procedures](#helper-procedures). Re-running a generated script reconciles the
+live job back to its source files, so it's safe to run on every deploy. The whole batch
+runs inside a transaction and rolls back if any step fails.
 
 > Because the script reconciles rather than recreates, editing a job's source and
 > re-deploying updates the live job in place — no need to drop it first. The job name
@@ -39,10 +40,6 @@ fails.
 
 ```
 Invoke-AgentHandler.ps1      The generator. This is the whole tool.
-sql/                         The Agent_Upsert_* helper procedures. Install once per instance.
-  dbo.Agent_Upsert_Job.sql
-  dbo.Agent_Upsert_JobStep.sql
-  ...
 job-source/                 Your hand-authored job definitions (one folder per job).
   scratch-db-purge/         Example job — copy this as a starting point.
     job.json                Job metadata + schedule(s).
@@ -50,6 +47,10 @@ job-source/                 Your hand-authored job definitions (one folder per j
 job-tsql/                   Generated output. Committed, but never edited by hand.
 brainstorm.md               Original design notes (historical).
 ```
+
+The `Agent_Upsert_*` helper procedures the generated scripts depend on are **not** part
+of this repo — they ship with the [dba-database](https://github.com/amtwo/dba-database)
+project. See [Helper procedures](#helper-procedures).
 
 ## Authoring a job
 
@@ -89,6 +90,23 @@ the real job name comes from `job.json`.
 
 Each entry in `schedules` describes one recurring schedule. A job can have zero,
 one, or many.
+
+> **Schedules are additive by design.** Unlike steps, schedules are *only* added and
+> updated — never pruned. A schedule removed from `job.json` is **left in place** on the
+> instance, and the `schedules` array is entirely optional. This is deliberate:
+>
+> - **Schedule the job by hand instead.** Omit `schedules` from `job.json` and let a DBA
+>   create the schedule directly on each server. The job definition still deploys from
+>   source; only the schedule is managed out-of-band.
+> - **Different schedules per environment.** Run the same job nightly in production but
+>   weekly in staging, say, without the deploy clobbering the per-environment schedule.
+> - **Scheduling is genuinely complicated** (blackout windows, staggered start times,
+>   maintenance windows) and is often better owned by whoever runs each instance.
+>
+> The trade-off: because nothing is pruned, schedules can drift — if you rename or retune
+> a schedule in source, the old one is **not** removed and you may end up with both. Edit
+> or delete the stale schedule on the instance by hand when that happens. (Steps, by
+> contrast, are fully reconciled — see [Limitations](#limitations).)
 
 ```json
 {
@@ -207,7 +225,8 @@ SQL Agent operator name.
 
 ## Helper procedures
 
-The idempotency lives in a small set of stored procedures under [`sql/`](sql/):
+The idempotency lives in a small set of stored procedures that ship with the
+[dba-database](https://github.com/amtwo/dba-database) project:
 
 | Procedure                    | Wraps                                      | Behavior              |
 |------------------------------|--------------------------------------------|-----------------------|
@@ -218,20 +237,18 @@ The idempotency lives in a small set of stored procedures under [`sql/`](sql/):
 | `Agent_Upsert_JobServer`     | `sp_add_jobserver`                         | create-if-missing     |
 
 Each does an existence check, then dispatches to the correct native create or update
-procedure. They are defined `CREATE OR ALTER`, so installing them is itself re-runnable.
+procedure.
 
-**Install them once per instance** into a utility database — `dba` by convention. The
-files don't carry a `USE` statement, so select the database when you run them:
+**These procedures are a prerequisite.** Install the
+[dba-database](https://github.com/amtwo/dba-database) on the target instance — it
+creates a `dba` utility database containing these procs (alongside the rest of the
+toolkit) — by following the install instructions in that project. If you already run
+dba-database, you likely have them already; just make sure you're on a version that
+includes the `Agent_Upsert_*` procs.
 
-```powershell
-# Install all helper procs into the [dba] database
-Get-ChildItem .\sql\dbo.Agent_Upsert_*.sql |
-    ForEach-Object { sqlcmd -S <instance> -d dba -i $_.FullName }
-```
-
-The generated scripts call these as `[dba].dbo.Agent_Upsert_*`. If you install them
-into a different database, pass its name to the generator with `-HelperDatabase` (see
-below) so the generated calls point at the right place.
+The generated scripts call these as `[dba].dbo.Agent_Upsert_*`. If your dba-database
+install lives under a different database name, pass it to the generator with
+`-HelperDatabase` (see below) so the generated calls point at the right place.
 
 ## Generating the scripts
 
@@ -283,9 +300,8 @@ GRANT EXECUTE ON SCHEMA::dbo TO [YourUser];
 ## Using it inside your own database project
 
 Invoke-AgentHandler is designed to be dropped into an existing database repo. The simplest
-layout is to vendor the generator, the `sql/` helper procs, and the `job-source/`
-convention into your repo (e.g. under a `sql-agent/` subfolder) and point the generator
-at it:
+layout is to vendor the generator and the `job-source/` convention into your repo (e.g.
+under a `sql-agent/` subfolder) and point the generator at it:
 
 ```powershell
 .\sql-agent\Invoke-AgentHandler.ps1 `
@@ -293,11 +309,11 @@ at it:
     -OutputPath .\deploy\post-deploy\agent-jobs
 ```
 
-Make sure the helper procs are installed on the target (deploy `sql/dbo.Agent_Upsert_*.sql`
-ahead of the job scripts — they're `CREATE OR ALTER`, so it's safe every time). Then
-include everything in `deploy\post-deploy\agent-jobs\*.sql` in your post-deploy step.
-The generated scripts are idempotent, so re-running them on each deploy reconciles the
-jobs back to source.
+Make sure the [dba-database](https://github.com/amtwo/dba-database) (which provides the
+`Agent_Upsert_*` procs) is installed on the target instance before the generated job
+scripts run — see [Helper procedures](#helper-procedures). Then include everything in
+`deploy\post-deploy\agent-jobs\*.sql` in your post-deploy step. The generated scripts are
+idempotent, so re-running them on each deploy reconciles the jobs back to source.
 
 ## Setting up the commit hook
 
@@ -371,6 +387,12 @@ git diff --exit-code job-tsql/ \
 - No support for replication-agent job types.
 - No MSX/multiserver (master/target) job support — jobs target `(LOCAL)`.
 - Reconciliation is keyed on the job name: renaming a job in `job.json` creates a new
-  job rather than renaming the existing one. Likewise, a step or schedule removed from
-  source is not dropped from the live job — the upsert only adds and updates.
-- Requires the `Agent_Upsert_*` helper procedures to be installed on the target instance.
+  job rather than renaming the existing one.
+- Steps removed from source *are* pruned from the live job (the script deletes any step
+  beyond the count defined in source).
+- Schedules are **additive by design** — a schedule removed from source is left in place,
+  not pruned. This is an intentional choice so jobs can be deployed from source while
+  schedules are managed per-environment or by hand. See [Schedules](#schedules).
+- Requires the `Agent_Upsert_*` helper procedures from
+  [dba-database](https://github.com/amtwo/dba-database) to be installed on the target
+  instance.
