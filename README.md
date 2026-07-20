@@ -122,6 +122,7 @@ one, or many.
 | Field        | Applies to        | Notes                                                              |
 |--------------|-------------------|--------------------------------------------------------------------|
 | `name`       | all               | Schedule name. Defaults to `<job name> schedule`.                  |
+| `enabled`    | all               | Whether the schedule is enabled. **Optional, defaults to `true`.** Set `false` to create the schedule disabled. |
 | `frequency`  | all               | `daily`, `weekly`, or `monthly`.                                   |
 | `time`       | all               | `HH:MM` or `HH:MM:SS`, 24-hour. Defaults to midnight.              |
 | `everyN`     | daily, weekly, monthly | The "every N" multiplier. **Optional, defaults to `1`.** `weekly` + `everyN: 2` = every 2 weeks. |
