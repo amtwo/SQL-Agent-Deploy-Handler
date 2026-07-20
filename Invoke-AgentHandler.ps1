@@ -421,11 +421,12 @@ function Build-JobScript {
     if ($meta.PSObject.Properties.Name -contains 'schedules' -and $meta.schedules) {
         foreach ($sched in $meta.schedules) {
             $schedName = if ($sched.PSObject.Properties.Name -contains 'name' -and $sched.name) { [string] $sched.name } else { "$jobName schedule" }
+            $schedEnabled = if ($sched.PSObject.Properties.Name -contains 'enabled') { [bool] $sched.enabled } else { $true }
             $schedArgs = ConvertTo-ScheduleArgs -Schedule $sched
             $null = $sb.AppendLine("    EXEC ${helper}Agent_Upsert_JobSchedule")
             $null = $sb.AppendLine("        @job_name = $(ConvertTo-SqlLiteral $jobName),")
             $null = $sb.AppendLine("        @name = $(ConvertTo-SqlLiteral $schedName),")
-            $null = $sb.AppendLine("        @enabled = 1,")
+            $null = $sb.AppendLine("        @enabled = = $([int][bool]$schedEnabled),")
             $null = $sb.AppendLine("        @freq_type = $($schedArgs.FreqType),")
             $null = $sb.AppendLine("        @freq_interval = $($schedArgs.FreqInterval),")
             $null = $sb.AppendLine("        @freq_recurrence_factor = $($schedArgs.FreqRecurrence),")
