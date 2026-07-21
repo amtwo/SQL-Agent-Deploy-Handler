@@ -414,7 +414,7 @@ function Build-JobScript {
             $null = $sb.AppendLine("    EXEC ${helper}Agent_Upsert_JobSchedule")
             $null = $sb.AppendLine("        @job_name = $(ConvertTo-SqlLiteral $jobName),")
             $null = $sb.AppendLine("        @name = $(ConvertTo-SqlLiteral $schedName),")
-            $null = $sb.AppendLine("        @enabled = = $([int][bool]$schedEnabled),")
+            $null = $sb.AppendLine("        @enabled = $([int][bool]$schedEnabled),")
             $null = $sb.AppendLine("        @freq_type = $($schedArgs.FreqType),")
             $null = $sb.AppendLine("        @freq_interval = $($schedArgs.FreqInterval),")
             $null = $sb.AppendLine("        @freq_recurrence_factor = $($schedArgs.FreqRecurrence),")
