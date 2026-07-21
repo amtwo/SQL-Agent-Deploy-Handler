@@ -397,24 +397,12 @@ function Build-JobScript {
 
     # Prune steps removed from source. Source defines steps 1..$stepCount, so any step
     # on the live job with a higher id was deleted from job-source and should go too.
-    # We build one sp_delete_jobstep call per orphan and run them via sp_executesql.
-    # Each call deletes step ($stepCount + 1): sp_delete_jobstep renumbers the remaining
-    # higher steps down, so the next orphan slides into that slot. Emitting one identical
-    # call per orphan therefore needs no particular ordering. For a brand-new job this
-    # finds nothing (no-op).
-    $pruneFromId = $stepCount + 1
+    # Agent_Prune_JobSteps deletes every step with step_id > @retain_step_number. For a
+    # brand-new job this finds nothing (no-op).
     $null = $sb.AppendLine("    -- Prune any steps beyond the $stepCount defined in source.")
-    $null = $sb.AppendLine("    DECLARE @jobName SYSNAME = $(ConvertTo-SqlLiteral $jobName);")
-    $null = $sb.AppendLine("    DECLARE @pruneSql NVARCHAR(MAX) = N'';")
-    $null = $sb.AppendLine("    SELECT @pruneSql = @pruneSql")
-    $null = $sb.AppendLine("            + N'EXEC msdb.dbo.sp_delete_jobstep @job_name = @jn, @step_id = $pruneFromId;'")
-    $null = $sb.AppendLine("            + NCHAR(13) + NCHAR(10)")
-    $null = $sb.AppendLine("    FROM msdb.dbo.sysjobsteps AS js")
-    $null = $sb.AppendLine("    JOIN msdb.dbo.sysjobs AS j ON j.job_id = js.job_id")
-    $null = $sb.AppendLine("    WHERE j.[name] = @jobName")
-    $null = $sb.AppendLine("      AND js.step_id > $stepCount;")
-    $null = $sb.AppendLine("    IF (@pruneSql <> N'')")
-    $null = $sb.AppendLine("        EXEC sys.sp_executesql @pruneSql, N'@jn SYSNAME', @jn = @jobName;")
+    $null = $sb.AppendLine("    EXEC ${helper}Agent_Prune_JobSteps")
+    $null = $sb.AppendLine("        @job_name = $(ConvertTo-SqlLiteral $jobName),")
+    $null = $sb.AppendLine("        @retain_step_number = $stepCount;")
     $null = $sb.AppendLine()
 
     # Schedules (0..N).
