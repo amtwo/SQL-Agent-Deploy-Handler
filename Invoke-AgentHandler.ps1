@@ -530,13 +530,19 @@ if (-not $jobFolders) {
 }
 
 $built = 0
+$failed = New-Object System.Collections.Generic.List[string]
 foreach ($folder in $jobFolders) {
     Write-Host "Building job from '$($folder.Name)'..."
     try {
         $script = Build-JobScript -JobFolder $folder -HelperDatabase $HelperDatabase
     }
     catch {
-        Write-Error "  Failed to build '$($folder.Name)': $($_.Exception.Message)"
+        # -ErrorAction Continue is load-bearing: $ErrorActionPreference is 'Stop' for the
+        # whole script, which would make this Write-Error terminating and abort the batch
+        # before the `continue` below ever ran. One bad job folder shouldn't stop the rest;
+        # the non-zero exit at the end is what tells CI something failed.
+        Write-Error "  Failed to build '$($folder.Name)': $($_.Exception.Message)" -ErrorAction Continue
+        $failed.Add($folder.Name)
         continue
     }
 
@@ -554,5 +560,12 @@ foreach ($folder in $jobFolders) {
 }
 
 Write-Host "Done. Generated $built job script(s) in '$OutputPath'."
+
+# Every good folder is built by now, but a partial run must not look like a clean one --
+# a commit hook or CI check would otherwise pass with stale or missing output.
+if ($failed.Count -gt 0) {
+    Write-Host "Failed to build $($failed.Count) job folder(s): $($failed -join ', ')"
+    exit 1
+}
 
 #endregion Main ----------------------------------------------------------------
