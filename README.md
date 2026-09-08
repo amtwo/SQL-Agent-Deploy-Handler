@@ -44,7 +44,7 @@ job-source/                            Your hand-authored job definitions (one f
   example-1/                           Example job — copy this as a starting point.
     job.json                           Job metadata + schedule(s).
     01_Purge scratchdb.sql             A T-SQL job step.
-    02_Cleanup temporary temp files.ps1  A PowerShell job step.
+    02_Cleanup temporary temp files.ps1  A PowerShell job step (deploys as CmdExec).
 job-tsql/                              Generated output. Committed, but never edited by hand.
 brainstorm.md                          Original design notes (historical).
 ```
@@ -140,10 +140,11 @@ filename with the prefix stripped:
 
 ```
 01_Purge scratchdb.sql      ──►  Step 1, TSQL subsystem
-02_Notify owner.ps1         ──►  Step 2, PowerShell subsystem
+02_Notify owner.ps1         ──►  Step 2, CmdExec subsystem, calling pwsh.exe
 ```
 
-`.sql` → TSQL subsystem, `.ps1` → PowerShell subsystem. Anything else is ignored.
+`.sql` → TSQL subsystem, `.ps1` → CmdExec subsystem (see
+[How PowerShell steps deploy](#how-powershell-steps-deploy)). Anything else is ignored.
 
 The body of the file is the step command, verbatim — write normal T-SQL (or
 PowerShell). The example:
@@ -170,7 +171,8 @@ comment in that language:
 
 A `.ps1` line that starts with a plain `#` (an ordinary PowerShell comment) is **not** a
 directive — only the `##>` marker is. The two markers are otherwise identical in
-behavior; the tables below use the `-->` form.
+behavior; the tables below use the `-->` form except for the directives that only apply to
+one language.
 
 Value directives:
 
@@ -178,6 +180,7 @@ Value directives:
 |----------------------|--------------|------------------------------------------------------------|
 | `--> StepName: <name>` | filename (sans `nn_`) | The job step name.                              |
 | `--> Database: <db>` | `master`     | Database the step runs in (TSQL steps only).               |
+| `##> PSEngine: powershell\|pwsh` | `pwsh` | Which PowerShell to call (`.ps1` steps only).    |
 | `--> Runas: <proxy>` | (none)       | Run the step as this Agent proxy account.                  |
 | `--> SuccessAction: next\|success\|failure` | `next` | What to do when the step succeeds.    |
 | `--> FailAction: next\|success\|failure`    | `failure` | What to do when the step fails.       |
@@ -196,10 +199,11 @@ Flag directives — presence turns the option on:
 > (there's no next step to go to), and `FailAction: next` collapses to "quit
 > reporting failure."
 
-A PowerShell step uses the `##>` marker for the same directives:
+A PowerShell step uses the `##>` marker for the same directives, plus `PSEngine`:
 
 ```powershell
 ##> StepName: Cleanup temporary temp files
+##> PSEngine: pwsh
 ##> RetryAttempts: 2
 ##> RetryInterval: 1
 
@@ -208,6 +212,61 @@ Get-ChildItem -Path 'C:\temp\temp' -File -Recurse |
     Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-365) } |
     Remove-Item -Force
 ```
+
+### How PowerShell steps deploy
+
+A `.ps1` step becomes a **CmdExec** job step, not a step in Agent's PowerShell subsystem.
+That subsystem is pinned to the legacy SQLPS host — old engine, no say in the matter. Going
+through CmdExec lets each step name the engine it wants:
+
+| `PSEngine` | Runs                              | Notes                        |
+|------------|-----------------------------------|------------------------------|
+| `pwsh`     | `pwsh.exe` (PowerShell 7+)        | **The default.** Must be installed on the instance and on `PATH` for the Agent service account. |
+| `powershell` | `powershell.exe` (Windows PowerShell 5.1) | Always present on Windows. Use for scripts that need the older engine. |
+
+The directive is case-insensitive and a trailing `.exe` is tolerated, so `pwsh`,
+`PWSH`, and `pwsh.exe` are all the same thing. Anything else is an error. On a `.sql` step
+the directive is ignored with a warning.
+
+The generated step command is the step body base64-encoded and handed over as
+`-EncodedCommand`:
+
+```
+pwsh.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand <base64 of the body>
+```
+
+Encoding rather than inlining the body is deliberate, and it isn't paranoia:
+
+- Step bodies are multi-line and routinely contain both `'` and `"`. Neither survives a
+  round trip through a Windows command line intact.
+- **Agent does token substitution on CmdExec commands.** A bare `$(...)` subexpression —
+  entirely ordinary PowerShell — reads as an unescaped Agent token and fails the step
+  before your code ever runs.
+
+Base64 has neither problem. The cost is a command that's unreadable in `msdb` and in a
+diff, so the generated `.sql` repeats the original body as `--` comment lines directly
+above each step:
+
+```sql
+-- Step 2 : Cleanup temporary temp files  (CmdExec -> pwsh.exe)
+-- Source body, passed to pwsh.exe as -EncodedCommand:
+--     ## Delete the temporary files that are only temporary.
+--     Get-ChildItem -Path 'C:\temp\temp' -File -Recurse | ...
+EXEC [dba].dbo.Agent_Upsert_JobStep
+    ...
+    @subsystem = N'CmdExec',
+    @command = N'pwsh.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand IwAjACAA...',
+```
+
+Two things to know about the switch to CmdExec:
+
+- **Success is the process exit code.** CmdExec treats exit code 0 as success. PowerShell
+  exits non-zero on an unhandled terminating error but **not** on a non-terminating one, so
+  a step that writes errors and keeps going still reports success. If a failure needs to
+  fail the job, `throw` it or `exit 1` explicitly.
+- **Long scripts can outgrow the command line.** Windows caps a command line near 8,191
+  characters and base64 inflates the body by roughly 2.7x. The generator warns past 8,000;
+  when you hit it, put the script in a file on the instance and call that instead.
 
 ### `notifications.json` (optional)
 
@@ -388,6 +447,12 @@ git diff --exit-code job-tsql/ \
 
 - No support for replication-agent job types.
 - No MSX/multiserver (master/target) job support — jobs target `(LOCAL)`.
+- PowerShell steps deploy as CmdExec, so the base64 command line is capped near 8,191
+  characters (roughly a 3,000-character script) and step success is the process exit code
+  rather than PowerShell's error stream. See
+  [How PowerShell steps deploy](#how-powershell-steps-deploy).
+- `PSEngine: pwsh` assumes `pwsh.exe` is installed and on `PATH` for the Agent service
+  account. The generator can't check that; the step fails at runtime if it isn't.
 - Reconciliation is keyed on the job name: renaming a job in `job.json` creates a new
   job rather than renaming the existing one.
 - Steps removed from source *are* pruned from the live job (the script deletes any step

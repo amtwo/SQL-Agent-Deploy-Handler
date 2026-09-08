@@ -1,4 +1,5 @@
 ##> StepName: Cleanup temporary temp files
+##> PSEngine: pwsh
 ##> RetryAttempts: 2
 ##> RetryInterval: 1
 

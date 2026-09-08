@@ -10,7 +10,19 @@
         job.json            Job-level metadata (name, category, description, schedules).
         notifications.json  (optional) Operator notification settings.
         nn_<step name>.sql  A T-SQL job step. The nn_ prefix sets the step number/order.
-        nn_<step name>.ps1  A PowerShell job step (PowerShell subsystem).
+        nn_<step name>.ps1  A PowerShell job step (deployed as a CmdExec step -- see below).
+
+    PowerShell steps deploy as CmdExec rather than the Agent PowerShell subsystem, which is
+    pinned to the legacy SQLPS host. The step body is base64-encoded and handed to the engine
+    named by the PSEngine directive as -EncodedCommand:
+
+        pwsh.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand <base64>
+
+    Encoding rather than inlining the body is deliberate: a multi-line script containing
+    quote characters does not survive a Windows command line intact, and Agent performs
+    token substitution on CmdExec commands, so an ordinary PowerShell $(...) subexpression
+    would read as an unescaped Agent token and fail the step. The generated script repeats
+    the original body as comments above each step so diffs stay reviewable.
 
     Step files may carry "special comment" directives on their own lines to control
     advanced job-step settings. These lines are parsed out and removed from the command
@@ -20,6 +32,7 @@
 
         --> StepName:      <step name>          (default: file name, sans the nn_ prefix)
         --> Database:      <DBName>             (TSQL steps only; default: master)
+        --> PSEngine:      powershell|pwsh      (PS steps only; default: pwsh)
         --> Runas:         <proxy account>      (default: omitted / runs as Agent service)
         --> SuccessAction: next|success|failure (default: next)
         --> FailAction:    next|success|failure (default: failure)
@@ -189,6 +202,7 @@ function Read-StepFile {
     $settings = [ordered]@{
         StepName                          = $null
         Database                          = 'master'
+        PSEngine                          = 'pwsh'
         Runas                             = $null
         SuccessAction                     = 'next'
         FailAction                        = 'failure'
@@ -199,9 +213,10 @@ function Read-StepFile {
         IncludeStepOutputInHistory        = $false
     }
 
-    $valueKeys = 'StepName', 'Database', 'Runas', 'SuccessAction', 'FailAction', 'RetryAttempts', 'RetryInterval'
+    $valueKeys = 'StepName', 'Database', 'PSEngine', 'Runas', 'SuccessAction', 'FailAction', 'RetryAttempts', 'RetryInterval'
     $flagKeys  = 'LogToTable', 'AppendOutputToExistingEntryInTable', 'IncludeStepOutputInHistory'
 
+    $psEngineSpecified = $false
     $bodyLines = New-Object System.Collections.Generic.List[string]
     foreach ($line in (Get-Content -LiteralPath $File.FullName)) {
         $m = [regex]::Match($line, $directiveRegex)
@@ -214,6 +229,7 @@ function Read-StepFile {
         $matched = $valueKeys | Where-Object { $_ -ieq $key } | Select-Object -First 1
         if ($matched) {
             $settings[$matched] = $val
+            if ($matched -eq 'PSEngine') { $psEngineSpecified = $true }
             continue
         }
         $matchedFlag = $flagKeys | Where-Object { $_ -ieq $key } | Select-Object -First 1
@@ -234,6 +250,18 @@ function Read-StepFile {
     }
     $settings.RetryAttempts = [int] $settings.RetryAttempts
     $settings.RetryInterval = [int] $settings.RetryInterval
+
+    # PowerShell engine. Unspecified means pwsh; a trailing .exe is tolerated so both
+    # "PSEngine: pwsh" and "PSEngine: pwsh.exe" work.
+    $settings.PSEngine = (([string] $settings.PSEngine).Trim() -replace '(?i)\.exe$', '').ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($settings.PSEngine)) { $settings.PSEngine = 'pwsh' }
+    if ($settings.PSEngine -notin 'powershell', 'pwsh') {
+        throw "Invalid PSEngine '$($settings.PSEngine)' in $($File.Name). Use powershell or pwsh."
+    }
+    if ($psEngineSpecified -and -not ($File.Extension -ieq '.ps1')) {
+        Write-Warning "  PSEngine directive in $($File.Name) is ignored -- it applies to .ps1 steps only."
+    }
+
     if ([string]::IsNullOrWhiteSpace([string] $settings.Runas)) { $settings.Runas = $null }
     if ([string]::IsNullOrWhiteSpace([string] $settings.Database)) { $settings.Database = 'master' }
     if ([string]::IsNullOrWhiteSpace([string] $settings.StepName)) { $settings.StepName = $null }
@@ -259,6 +287,25 @@ function Get-StepFlags {
         $flags = $flags -bor 32
     }
     return $flags
+}
+
+# Wrap a PowerShell step body into a single CmdExec command line.
+#
+# The body goes across as -EncodedCommand (base64 of UTF-16LE) rather than inline after
+# -Command, for two reasons:
+#   * step bodies are multi-line and routinely contain both quote characters, and neither
+#     survives a round trip through a Windows command line intact; and
+#   * Agent does token substitution on CmdExec commands, so a bare $(...) subexpression --
+#     ordinary PowerShell -- reads as an unescaped Agent token and fails the step outright.
+# Base64 sidesteps both. The cost is an opaque command in msdb, which is why the generated
+# script repeats the original body as comments above the step.
+function ConvertTo-PSCommandLine {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string] $Body,
+        [Parameter(Mandatory)][ValidateSet('powershell', 'pwsh')][string] $Engine
+    )
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Body))
+    return "$Engine.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded"
 }
 
 #endregion Helpers -------------------------------------------------------------
@@ -367,7 +414,24 @@ function Build-JobScript {
             if ([string]::IsNullOrWhiteSpace($stepName)) { $stepName = $file.BaseName }
         }
 
-        $subsystem = if ($file.Extension -ieq '.ps1') { 'PowerShell' } else { 'TSQL' }
+        # .ps1 steps deploy as CmdExec, not the Agent PowerShell subsystem: that subsystem is
+        # pinned to the legacy SQLPS host, while CmdExec lets each step name its own engine.
+        $isPowerShell = ($file.Extension -ieq '.ps1')
+        if ($isPowerShell) {
+            $subsystem      = 'CmdExec'
+            $subsystemLabel = "CmdExec -> $($settings.PSEngine).exe"
+            $command        = ConvertTo-PSCommandLine -Body $parsed.Command -Engine $settings.PSEngine
+            # A Windows command line is capped near 8191 characters; a base64 body inflates
+            # roughly 2.7x, so a long script can quietly outgrow it.
+            if ($command.Length -gt 8000) {
+                Write-Warning "  Step $stepId ($stepName) builds a $($command.Length)-character command line, over the ~8191 Windows limit. Move the body into a script file and call it instead."
+            }
+        }
+        else {
+            $subsystem      = 'TSQL'
+            $subsystemLabel = 'TSQL'
+            $command        = $parsed.Command
+        }
 
         $onSuccess = Get-StepActionCode -Action $settings.SuccessAction -IsLastStep $isLast -LastStepCollapse 'success'
         $onFail    = Get-StepActionCode -Action $settings.FailAction    -IsLastStep $isLast -LastStepCollapse 'failure'
@@ -378,13 +442,21 @@ function Build-JobScript {
         $dbArg    = if ($subsystem -eq 'TSQL') { ConvertTo-SqlLiteral $settings.Database } else { 'NULL' }
         $proxyArg = if ($settings.Runas) { ConvertTo-SqlLiteral $settings.Runas } else { 'NULL' }
 
-        $null = $sb.AppendLine("    -- Step $stepId : $stepName  ($subsystem)")
+        $null = $sb.AppendLine("    -- Step $stepId : $stepName  ($subsystemLabel)")
+        if ($isPowerShell) {
+            # Repeat the body verbatim so the generated script still diffs readably -- the
+            # @command below is its base64 form and is unreviewable on its own.
+            $null = $sb.AppendLine("    -- Source body, passed to $($settings.PSEngine).exe as -EncodedCommand:")
+            foreach ($bodyLine in ($parsed.Command -split "`r?`n")) {
+                $null = $sb.AppendLine("    --     $bodyLine")
+            }
+        }
         $null = $sb.AppendLine("    EXEC ${helper}Agent_Upsert_JobStep")
         $null = $sb.AppendLine("        @job_name = $(ConvertTo-SqlLiteral $jobName),")
         $null = $sb.AppendLine("        @step_id = $stepId,")
         $null = $sb.AppendLine("        @step_name = $(ConvertTo-SqlLiteral $stepName),")
         $null = $sb.AppendLine("        @subsystem = $(ConvertTo-SqlLiteral $subsystem),")
-        $null = $sb.AppendLine("        @command = $(ConvertTo-SqlLiteral $parsed.Command),")
+        $null = $sb.AppendLine("        @command = $(ConvertTo-SqlLiteral $command),")
         $null = $sb.AppendLine("        @database_name = $dbArg,")
         $null = $sb.AppendLine("        @proxy_name = $proxyArg,")
         $null = $sb.AppendLine("        @on_success_action = $onSuccess,")
