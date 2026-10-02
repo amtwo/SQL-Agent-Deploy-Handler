@@ -40,6 +40,7 @@ runs inside a transaction and rolls back if any step fails.
 
 ```
 Invoke-AgentHandler.ps1                The generator. This is the whole tool.
+Build-AgentJobs.ps1                    Optional build-time wrapper for database projects (see below).
 job-source/                            Your hand-authored job definitions (one folder per job).
   example-1/                           Example job — copy this as a starting point.
     job.json                           Job metadata + schedule(s).
@@ -296,6 +297,7 @@ The idempotency lives in a small set of stored procedures that ship with the
 | `Agent_Upsert_JobStep`       | `sp_add_jobstep` / `sp_update_jobstep`     | upsert by step id     |
 | `Agent_Upsert_JobSchedule`   | `sp_add_jobschedule` / `sp_update_jobschedule` | upsert by name    |
 | `Agent_Upsert_JobServer`     | `sp_add_jobserver`                         | create-if-missing     |
+| `Agent_Prune_JobSteps`       | `sp_delete_jobstep`                        | delete steps beyond the count in source |
 
 Each does an existence check, then dispatches to the correct native create or update
 procedure.
@@ -375,6 +377,32 @@ Make sure the [dba-database](https://github.com/amtwo/dba-database) (which provi
 scripts run — see [Helper procedures](#helper-procedures). Then include everything in
 `deploy\post-deploy\agent-jobs\*.sql` in your post-deploy step. The generated scripts are
 idempotent, so re-running them on each deploy reconciles the jobs back to source.
+
+### Generating at build time (SSDT / SDK-style `.sqlproj`)
+
+Instead of committing `job-tsql/` and keeping it fresh with a commit hook, a database
+project can regenerate it on every build. `Build-AgentJobs.ps1` runs the generator, then
+writes a manifest (`_include.sql` by default) with one sqlcmd `:r` line per generated
+script. Vendor it next to `Invoke-AgentHandler.ps1`.
+
+1. Run it from a target that fires before the build:
+
+   ```xml
+   <Target Name="GenerateAgentJobScripts" BeforeTargets="BeforeBuild">
+     <Exec Command="pwsh -NoProfile -File &quot;$(MSBuildProjectDirectory)/sql-agent/Build-AgentJobs.ps1&quot; -SourcePath &quot;$(MSBuildProjectDirectory)/sql-agent/job-source&quot; -OutputPath &quot;$(MSBuildProjectDirectory)/sql-agent/job-tsql&quot;" />
+   </Target>
+   ```
+
+2. Include the manifest from the post-deploy script, once:
+
+   ```sql
+   :r .\sql-agent\job-tsql\_include.sql
+   ```
+
+Adding or removing a job then needs no post-deploy edit. The wrapper throws if any job
+folder fails to generate, before the manifest is rewritten, so a broken job fails the
+build instead of silently dropping out of the deploy. Generation happens on the build
+agent, so there's no per-clone hook to set up, and `job-tsql/` can be git-ignored.
 
 ## Setting up the commit hook
 
